@@ -5,16 +5,17 @@ Cross-Claude task delegation, cloud-hosted. Async, allowlist-gated, SMS-notified
 ## Install
 
 1. Ask admin (Chinat) to add you to the allowlist via the host's `/admin` page.
-2. Install the plugin:
+2. In Claude Code, add the marketplace and install (one-time):
    ```
-   /plugins install cyu60/beeper-v2
+   /plugin marketplace add cyu60/beeper-v2
+   /plugin install beeper-v2
    ```
 3. Add to your `~/.zshenv`:
    ```bash
    export BEEPER_USER=<your-id>       # e.g. edward, kaan, chinat, jeffrey
    export BEEPER_API_URL=https://beeper-v2-host.vercel.app
    ```
-4. `source ~/.zshenv`. Done.
+4. `source ~/.zshenv`, restart your Claude Code session. Done — `/beeper-v2` is now a slash command.
 
 ## Use
 
