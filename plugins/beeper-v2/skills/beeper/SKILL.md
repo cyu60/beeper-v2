@@ -68,6 +68,29 @@ Field caps the API enforces:
 Omit any optional field by setting it to an empty string (or `'{}'` for metadata) — the API treats empty values as absent.
 
 6. Show the returned `id` (e.g. `b_7f3a`) and `recipient_notified` flag to the user.
+7. **Append to the local send log** so the user has a paper trail outside the host DB:
+
+```bash
+mkdir -p ~/.beeper
+RESP="$(curl ... )"   # response from step 5
+BEEP_ID="$(echo "$RESP" | jq -r .id)"
+NOTIFIED="$(echo "$RESP" | jq -r .recipient_notified)"
+TS="$(echo "$RESP" | jq -r .created_at)"
+PREVIEW="$(printf '%s' "$TASK" | tr '\n' ' ' | head -c 160)"
+jq -nc \
+  --arg ts "$TS" \
+  --arg beep_id "$BEEP_ID" \
+  --arg from "$BEEPER_USER" \
+  --arg to "$TO" \
+  --arg kind "${KIND:-task}" \
+  --arg title "$TITLE" \
+  --arg preview "$PREVIEW" \
+  --argjson notified "$NOTIFIED" \
+  '{ts:$ts,channel:"beeper",beep_id:$beep_id,from:$from,to:$to,kind:$kind,title:$title,task_preview:$preview,recipient_notified:$notified}' \
+  >> ~/.beeper/sent.log
+```
+
+Tail the log any time with `tail ~/.beeper/sent.log | jq .`.
 
 ### Attachments (optional, sender-only, before reply lands)
 
@@ -148,7 +171,21 @@ curl -fsS -X POST "$BEEPER_API_URL/api/beeps/$ID/decline" \
 
 ### Onboard
 
-Use this when the user wants to bring a NEW person onto Beeper — someone who isn't on the allowlist yet and doesn't have Beeper installed. The output goes via iMessage (clipboard paste), not the Beeper API.
+Use this when the user wants to bring a NEW person onto Beeper. There are two delivery paths — pick based on whether the recipient is already a registered Beeper user.
+
+**Path A — `kind=onboarding` send (recipient is registered, or chinat as admin can bypass allowlist):** the host route detects `kind=onboarding` and sends the task body verbatim via Twilio SMS (no wake-signal scaffold, newlines preserved, capped at 1600 chars). This is the preferred path because the audit row lands in `beeps` and the send is auto-logged to `~/.beeper/sent.log`.
+
+```bash
+TO="lia"                          # recipient id
+TASK="$(sed "s/\[name\]/Lia/g" "$TEMPLATE_PATH")"
+curl -fsS -X POST "$BEEPER_API_URL/api/beeps" \
+  -H 'content-type: application/json' \
+  -d "$(jq -nc --arg from "$BEEPER_USER" --arg to "$TO" --arg task "$TASK" \
+        '{from:$from,to:$to,task:$task,kind:"onboarding",urgency:"normal"}')"
+# remember to append to ~/.beeper/sent.log (see Send step 7)
+```
+
+**Path B — iMessage paste (recipient isn't on Beeper at all):** format the template, copy to clipboard, the user pastes it into iMessage.
 
 The canned template lives at `templates/onboarding.md` inside this plugin. Resolve its absolute path so you can read it from any cwd:
 
@@ -163,6 +200,15 @@ sed "s/\[name\]/$NAME/g" "$TEMPLATE_PATH" | tee /tmp/beeper-onboard.txt | pbcopy
 echo "copied to clipboard. paste into iMessage."
 echo "---"
 cat /tmp/beeper-onboard.txt
+
+# Also log the iMessage send for the local paper trail
+mkdir -p ~/.beeper
+jq -nc \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg to "$NAME" \
+  --arg preview "$(head -c 160 /tmp/beeper-onboard.txt | tr '\n' ' ')" \
+  '{ts:$ts,channel:"imessage",to:$to,via:"clipboard-paste",body_preview:$preview}' \
+  >> ~/.beeper/sent.log
 ```
 
 Then tell the user:
