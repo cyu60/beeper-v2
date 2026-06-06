@@ -121,12 +121,14 @@ curl -fsS "$BEEPER_API_URL/api/beeps?to=$BEEPER_USER&status=open" \
   | jq -r '.beeps[] | "\(.id)  from=\(.from)  urgency=\(.urgency)  \(.created_at)\n  title: \(.title // "(none)")\n  task:  \(.task)\n  acceptance: \(.acceptance // "(none)")\n  metadata: \(.metadata)\n  cwd=\(.cwd // "(none)")\n  transcript_requested=\(.request_transcript)\n"'
 ```
 
+`status` filter accepts `open`, `closed`, `declined`, or `acknowledged` (omit it to get all). A beep ends up `acknowledged` when its recipient silently closed it via an SMS `ACK` (see SMS-back below) — it's a terminal state like `closed`/`declined`, but signals "seen, no substantive reply."
+
 For each beep:
 - Read out the **title** (if present), then body, then acceptance criteria.
 - Note any metadata fields that matter (deadline, pr_number, etc.).
 - If `request_transcript=true`, flag that the sender will see your Claude trace on reply.
 - Check for attachments — `GET /api/beeps/$ID/attachments?as=$BEEPER_USER` — and offer to download them if any are present.
-- Ask the user: **execute**, **reply with note**, or **decline**.
+- Ask the user: **execute**, **reply with note**, **acknowledge** (silent close, no SMS to sender — for "got it"/"on it" receipts), or **decline**.
 
 ### Reply
 
@@ -168,6 +170,19 @@ curl -fsS -X POST "$BEEPER_API_URL/api/beeps/$ID/decline" \
   -H 'content-type: application/json' \
   -d "$(jq -nc --arg by "$BEEPER_USER" --arg reason "$REASON" '{by:$by,reason:$reason}')"
 ```
+
+### Acknowledge
+
+Silently closes the beep as `acknowledged` — **does NOT text the original sender**. Use it for low-content receipts ("got it", "ok", "on it", "noted", "👍") that are neither a real answer nor a refusal, so the sender isn't spammed with an empty reply. Takes no reason/payload.
+
+```bash
+ID="b_7f3a"
+curl -fsS -X POST "$BEEPER_API_URL/api/beeps/$ID/acknowledge" \
+  -H 'content-type: application/json' \
+  -d "$(jq -nc --arg by "$BEEPER_USER" '{by:$by}')"
+```
+
+Returns `{id, status:"acknowledged"}`. If the user is about to reply with something contentless, prefer this over an empty `reply` so the sender's queue shows it handled without a meaningless SMS.
 
 ### Onboard
 
@@ -222,12 +237,15 @@ The host has an inbound-SMS endpoint at `/api/twilio/inbound`. Once Twilio's web
 
 - `REPLY <beep_id> <text>` → closes the beep with `<text>` as the reply
 - `DECLINE <beep_id> <reason>` → marks declined with `<reason>`
+- `ACK <beep_id>` (alias `ACKNOWLEDGE`) → silently closes the beep as `acknowledged`. Takes **no payload**. Unlike REPLY/DECLINE, it does NOT text the original sender — use it for low-content receipts ("got it", "ok", "on it", "noted", "👍") that are neither a real answer nor a refusal, so the sender isn't spammed with an empty acknowledgement.
 
-Verb is case-insensitive. Phone is mapped to user via `users.phone`. Unknown grammar gets a help-text SMS back. If the user mentions "I texted back the beep," confirm the beep is now `status=closed` (or `declined`) before re-prompting.
+Verb is case-insensitive. Phone is mapped to user via `users.phone`. Unknown grammar gets a help-text SMS back. If the user mentions "I texted back the beep," confirm the beep is now `status=closed`, `declined`, or `acknowledged` before re-prompting.
+
+`ACK` here is the SMS shorthand for the same close as the **Acknowledge** block above — from inside Claude use that curl call instead.
 
 ## MCP — install Beeper in ChatGPT / other LLM clients
 
-The host exposes Beeper as a Model Context Protocol server at `POST /api/mcp/v1?user=<id>`. Tools: `send_beep`, `list_open_beeps`, `reply_beep`, `decline_beep`. If the user asks "can I use Beeper from ChatGPT?", point them at:
+The host exposes Beeper as a Model Context Protocol server at `POST /api/mcp/v1?user=<id>`. Tools: `send_beep`, `list_open_beeps`, `reply_beep`, `decline_beep`, `acknowledge_beep`. If the user asks "can I use Beeper from ChatGPT?", point them at:
 
 ```
 https://beeper-v2-host.vercel.app/api/mcp/v1?user=<their_beeper_id>
@@ -249,7 +267,7 @@ https://beeper-v2-host.vercel.app/api/mcp/v1?user=<their_beeper_id>
 - `400 validation_failed` with `metadata must be a JSON object` → user passed an array or non-object. Wrap in `{}`.
 - `403 not_allowed` → user is not on the recipient's allowlist. Tell them to ask admin (Chinat) to add the edge via `/admin`.
 - `404 unknown_user` → recipient typo. Confirm spelling against the canonical ids.
-- `409 already_closed` → the beep was already replied to or declined. Show the user the prior outcome.
+- `409 already_closed` → the beep was already replied to, declined, or acknowledged. Show the user the prior outcome.
 - `413 too_large` → transcript or attachment over 25 MB. Offer to retry with `X-Beeper-Force: true` (up to 100 MB) or skip.
 - `415 validation_failed` (attachment) → MIME type not on the allowlist. Convert (PDF/PNG/text) or skip.
 - Network errors → don't retry sends silently (would create a duplicate beep). Tell the user, ask whether to retry.
