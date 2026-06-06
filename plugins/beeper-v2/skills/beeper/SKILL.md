@@ -7,6 +7,8 @@ description: Cross-Claude task delegation over a cloud queue. Use when the user 
 
 The skill talks to the Beeper v2 host at `$BEEPER_API_URL` over HTTPS. The user identifies as `$BEEPER_USER`. The host gates sends by an allowlist — no API keys needed on the client.
 
+A beep is **a task you're delegating to someone else's Claude session**, not a chat message. Think Linear ticket — title, body, optional acceptance criteria, optional metadata, optional file attachments. The receiver Claude reads it like a ticket and posts a `reply` when the task is done.
+
 ## Environment
 
 Required in `~/.zshenv`:
@@ -29,35 +31,78 @@ export BEEPER_API_URL=https://beeper-v2-host.vercel.app
 ### Send
 
 1. Identify the recipient by name (match to a lowercase id like `edward`, `kaan`, `chinat`, `jeffrey`). Confirm with the user.
-2. Show the **verbatim** task you'll send — do not paraphrase or summarize.
-3. Ask the user three quick decisions: urgency (low/normal/high, default normal), attach cwd?, request transcript on reply?
-4. Confirm Y/N. On Y:
+2. Draft the structured payload. **Required:** `to`, `task` (the body, what + why). **Strongly recommended:** `title` (short noun-phrase, ≤200 chars — becomes the SMS preview). **Optional:** `acceptance` ("done when…"), `metadata` (`{ project, deadline, related_url, pr_number, tags, ... }`).
+3. Show the **verbatim** payload — do not paraphrase or summarize.
+4. Ask the user three quick decisions: urgency (low/normal/high, default normal), attach cwd?, request transcript on reply?
+5. Confirm Y/N. On Y:
 
 ```bash
 TO="edward"                          # recipient id
-TASK="ask what columns are in judges_v2 right now"   # verbatim
+TITLE="audit judges_v2 columns"      # short, optional but recommended
+TASK="compare the deployed judges_v2 schema against the migration in PR #42 and tell me which columns are missing"  # the body, verbatim
+ACCEPTANCE="list every column present in prod but not in PR #42, and vice versa"   # optional
+METADATA='{"project":"fauxnd","pr_number":42,"related_url":"https://github.com/edumame/fauxnd/pull/42"}'  # optional JSON object
 CWD="$(pwd)"                         # or empty
 URGENCY="normal"                     # low | normal | high
 REQUEST_TRANSCRIPT="false"           # true | false
 
 curl -fsS -X POST "$BEEPER_API_URL/api/beeps" \
   -H 'content-type: application/json' \
-  -d "$(jq -nc --arg from "$BEEPER_USER" --arg to "$TO" --arg task "$TASK" \
+  -d "$(jq -nc \
+        --arg from "$BEEPER_USER" --arg to "$TO" \
+        --arg title "$TITLE" --arg task "$TASK" --arg acceptance "$ACCEPTANCE" \
+        --argjson metadata "${METADATA:-\{\}}" \
         --arg cwd "$CWD" --arg urg "$URGENCY" \
         --argjson req "$REQUEST_TRANSCRIPT" \
-        '{from:$from,to:$to,task:$task,cwd:$cwd,urgency:$urg,request_transcript:$req}')"
+        '{from:$from, to:$to, title:$title, task:$task, acceptance:$acceptance, metadata:$metadata, cwd:$cwd, urgency:$urg, request_transcript:$req}')"
 ```
 
-5. Show the returned `id` (e.g. `b_7f3a`) and `recipient_notified` flag to the user.
+Field caps the API enforces:
+- `title` ≤ 200 chars
+- `task` ≤ 8192 chars
+- `acceptance` ≤ 4096 chars
+- `metadata` ≤ 16 KB serialized (must be a JSON object, not array)
+- `cwd` ≤ 512 chars
+
+Omit any optional field by setting it to an empty string (or `'{}'` for metadata) — the API treats empty values as absent.
+
+6. Show the returned `id` (e.g. `b_7f3a`) and `recipient_notified` flag to the user.
+
+### Attachments (optional, sender-only, before reply lands)
+
+If the delegation needs context the receiver Claude should see — a mockup, schema dump, PDF, screenshot — attach files to the beep after it's been created. Sender-only; allowed MIME: `text/*`, `image/*`, `application/pdf`, `application/json`; default cap 25 MB; pass `X-Beeper-Force: true` to raise to 100 MB.
+
+```bash
+ID="b_7f3a"
+FILE="./mockup.png"
+curl -fsS -X POST "$BEEPER_API_URL/api/beeps/$ID/attachments" \
+  -H "X-Beeper-User: $BEEPER_USER" \
+  -F "file=@$FILE"
+```
+
+List or download (sender OR recipient):
+
+```bash
+# list
+curl -fsS "$BEEPER_API_URL/api/beeps/$ID/attachments?as=$BEEPER_USER" | jq .
+
+# download (returns 302 → follow it)
+curl -fLsS "$BEEPER_API_URL/api/beeps/$ID/attachments/<attachment_id>?as=$BEEPER_USER" -o downloaded.bin
+```
 
 ### Check
 
 ```bash
 curl -fsS "$BEEPER_API_URL/api/beeps?to=$BEEPER_USER&status=open" \
-  | jq -r '.beeps[] | "\(.id)  from=\(.from)  urgency=\(.urgency)  \(.created_at)\n  \(.task)\n  cwd=\(.cwd // "(none)")\n  transcript_requested=\(.request_transcript)\n"'
+  | jq -r '.beeps[] | "\(.id)  from=\(.from)  urgency=\(.urgency)  \(.created_at)\n  title: \(.title // "(none)")\n  task:  \(.task)\n  acceptance: \(.acceptance // "(none)")\n  metadata: \(.metadata)\n  cwd=\(.cwd // "(none)")\n  transcript_requested=\(.request_transcript)\n"'
 ```
 
-For each beep, ask the user: **execute**, **reply with note**, or **decline**. Surface the `transcript_requested` flag if true so they know the sender will see the trace.
+For each beep:
+- Read out the **title** (if present), then body, then acceptance criteria.
+- Note any metadata fields that matter (deadline, pr_number, etc.).
+- If `request_transcript=true`, flag that the sender will see your Claude trace on reply.
+- Check for attachments — `GET /api/beeps/$ID/attachments?as=$BEEPER_USER` — and offer to download them if any are present.
+- Ask the user: **execute**, **reply with note**, or **decline**.
 
 ### Reply
 
@@ -100,6 +145,25 @@ curl -fsS -X POST "$BEEPER_API_URL/api/beeps/$ID/decline" \
   -d "$(jq -nc --arg by "$BEEPER_USER" --arg reason "$REASON" '{by:$by,reason:$reason}')"
 ```
 
+## SMS-back (reply without opening Claude)
+
+The host has an inbound-SMS endpoint at `/api/twilio/inbound`. Once Twilio's webhook is pointed at it, the user can reply to a beep by texting the Beeper number directly:
+
+- `REPLY <beep_id> <text>` → closes the beep with `<text>` as the reply
+- `DECLINE <beep_id> <reason>` → marks declined with `<reason>`
+
+Verb is case-insensitive. Phone is mapped to user via `users.phone`. Unknown grammar gets a help-text SMS back. If the user mentions "I texted back the beep," confirm the beep is now `status=closed` (or `declined`) before re-prompting.
+
+## MCP — install Beeper in ChatGPT / other LLM clients
+
+The host exposes Beeper as a Model Context Protocol server at `POST /api/mcp/v1?user=<id>`. Tools: `send_beep`, `list_open_beeps`, `reply_beep`, `decline_beep`. If the user asks "can I use Beeper from ChatGPT?", point them at:
+
+```
+https://beeper-v2-host.vercel.app/api/mcp/v1?user=<their_beeper_id>
+```
+
+— and tell them to add it as a Custom Connector in ChatGPT settings.
+
 ## Trust boundary
 
 - The cloud server's allowlist is the only sender gate. If you get `403 not_allowed`, tell the user explicitly — don't quietly retry with a different recipient.
@@ -110,8 +174,11 @@ curl -fsS -X POST "$BEEPER_API_URL/api/beeps/$ID/decline" \
 
 - `BEEPER_USER not set` → tell the user to `export BEEPER_USER=<name>` in `~/.zshenv`, then `source ~/.zshenv`.
 - `BEEPER_API_URL not set` → same fix with the cloud URL.
+- `400 validation_failed` with `title too long` / `acceptance too long` / `metadata too large` → trim per the caps above.
+- `400 validation_failed` with `metadata must be a JSON object` → user passed an array or non-object. Wrap in `{}`.
 - `403 not_allowed` → user is not on the recipient's allowlist. Tell them to ask admin (Chinat) to add the edge via `/admin`.
 - `404 unknown_user` → recipient typo. Confirm spelling against the canonical ids.
 - `409 already_closed` → the beep was already replied to or declined. Show the user the prior outcome.
-- `413 too_large` → transcript over 25 MB. Offer to retry with `--force-transcript` (up to 100 MB) or skip the transcript entirely.
+- `413 too_large` → transcript or attachment over 25 MB. Offer to retry with `X-Beeper-Force: true` (up to 100 MB) or skip.
+- `415 validation_failed` (attachment) → MIME type not on the allowlist. Convert (PDF/PNG/text) or skip.
 - Network errors → don't retry sends silently (would create a duplicate beep). Tell the user, ask whether to retry.
